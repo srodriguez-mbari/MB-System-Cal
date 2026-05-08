@@ -26,6 +26,7 @@ message("In src/utilities")
 
 find_package(FFTW REQUIRED)
 find_package(LibPROJ REQUIRED)
+find_package(NetCDF REQUIRED)
 
 set(executables
     mb7k2jstar
@@ -85,7 +86,7 @@ file(WRITE levitus.h
 add_executable(mbcalibration_export
     mbcalibration_export.cc
     mb_ancillary_io.cc)
-target_link_libraries(mbcalibration_export PRIVATE mbio mbbsio mbaux mbsapi mbgsf m pthread)
+target_link_libraries(mbcalibration_export PRIVATE mbio mbbsio mbaux mbsapi mbgsf m pthread NetCDF::NetCDF)
 
 target_link_libraries(mbsvpselect PRIVATE LibPROJ::LibPROJ)
 target_link_libraries(mbgrid PRIVATE mbaux)
