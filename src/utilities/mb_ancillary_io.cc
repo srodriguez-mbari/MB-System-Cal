@@ -1,5 +1,5 @@
 /*--------------------------------------------------------------------
- *    The MB-system:  mb_sidecar_io.cc
+ *    The MB-system:  mb_ancillary_io.cc
  *
  *    Copyright (c) 2026 by
  *    Sebastian Rodriguez (seroma09@gmail.com)
@@ -8,7 +8,7 @@
  *    See README.md file for copying and redistribution conditions.
  *--------------------------------------------------------------------*/
 
-#include "mb_sidecar_io.h"
+#include "mb_ancillary_io.h"
 
 #include <algorithm>
 #include <cstdio>
