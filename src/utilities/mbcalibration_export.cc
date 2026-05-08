@@ -43,6 +43,7 @@
 
 #include "mb_define.h"
 #include "mb_format.h"
+#include "mb_io.h"
 #include "mb_status.h"
 #include "mb_ancillary_io.h"
 
@@ -55,6 +56,59 @@
         return _r; \
     } \
 } while(0)
+
+/* Extrinsics and preprocessing flags to embed as optimizer starting point */
+struct ExtrinsicsInfo {
+    char   sensor2_model[MB_LONGNAME_LENGTH] = {};
+    double tx_lever_sfm[3]  = {0, 0, 0};  /* TX (offset 0) S/F/U meters */
+    double rx_lever_sfm[3]  = {0, 0, 0};  /* RX (offset 1) S/F/U meters */
+    double boresight_hrp[3] = {0, 0, 0};  /* shared H/R/P degrees */
+    bool   platform_loaded  = false;
+
+    /* Kluge flags that have geometric impact on the data */
+    bool   kluge_flipsign_pitch   = false;
+    bool   kluge_flipsign_roll    = false;
+    double kluge_soundspeed_tweak = 1.0;
+    bool   attitude_zero_heave    = false;
+};
+
+/* Read sensor 2 extrinsics from a platform file.
+ * target_sensor is the .plf sensor index for the multibeam (typically 2). */
+static void load_platform_extrinsics(const char *plf_path, int target_sensor,
+                                     ExtrinsicsInfo& ex) {
+    int verbose = 0, error;
+    void *platform_ptr = nullptr;
+    if (mb_platform_read(verbose, (char *)plf_path, &platform_ptr, &error) != MB_SUCCESS
+        || platform_ptr == nullptr)
+        return;
+
+    struct mb_platform_struct *platform = (struct mb_platform_struct *)platform_ptr;
+    if (target_sensor < 0 || target_sensor >= platform->num_sensors) {
+        mb_platform_deall(verbose, &platform_ptr, &error);
+        return;
+    }
+
+    struct mb_sensor_struct *sensor = &platform->sensors[target_sensor];
+    snprintf(ex.sensor2_model, sizeof(ex.sensor2_model), "%s", sensor->model);
+
+    if (sensor->num_offsets >= 1) {
+        struct mb_sensor_offset_struct *tx = &sensor->offsets[0];
+        ex.tx_lever_sfm[0]  = tx->position_offset_x;
+        ex.tx_lever_sfm[1]  = tx->position_offset_y;
+        ex.tx_lever_sfm[2]  = tx->position_offset_z;
+        ex.boresight_hrp[0] = tx->attitude_offset_heading;
+        ex.boresight_hrp[1] = tx->attitude_offset_roll;
+        ex.boresight_hrp[2] = tx->attitude_offset_pitch;
+    }
+    if (sensor->num_offsets >= 2) {
+        struct mb_sensor_offset_struct *rx = &sensor->offsets[1];
+        ex.rx_lever_sfm[0] = rx->position_offset_x;
+        ex.rx_lever_sfm[1] = rx->position_offset_y;
+        ex.rx_lever_sfm[2] = rx->position_offset_z;
+    }
+    ex.platform_loaded = true;
+    mb_platform_deall(verbose, &platform_ptr, &error);
+}
 
 struct CalWriter {
     int  ncid      = -1;
@@ -89,7 +143,8 @@ static int set_compression(int ncid, int varid, int max_beam) {
 
 static int calwriter_open(CalWriter& w, const std::string& path,
                            int max_beam, const std::string& platform_file,
-                           const std::string& command_line) {
+                           const std::string& command_line,
+                           const ExtrinsicsInfo& ex) {
     w.max_beam = max_beam;
     w.amp_buf.resize(max_beam);
     w.ok_buf.resize(max_beam);
@@ -170,8 +225,6 @@ static int calwriter_open(CalWriter& w, const std::string& path,
                     strlen(MB_VERSION), MB_VERSION);
     nc_put_att_text(w.ncid, NC_GLOBAL, "creation_time",
                     strlen(tstr), tstr);
-    nc_put_att_text(w.ncid, NC_GLOBAL, "platform_file",
-                    platform_file.size(), platform_file.c_str());
     nc_put_att_text(w.ncid, NC_GLOBAL, "command_line",
                     command_line.size(), command_line.c_str());
     nc_put_att_text(w.ncid, NC_GLOBAL, "attitude_source",
@@ -185,6 +238,34 @@ static int calwriter_open(CalWriter& w, const std::string& path,
                              "raw INS before boresight (from .baa ancillary file)");
     int target_sensor = 2;
     nc_put_att_int(w.ncid, NC_GLOBAL, "platform_target_sensor", NC_INT, 1, &target_sensor);
+
+    /* --- Platform file and sensor 2 extrinsics (optimizer starting point) --- */
+    nc_put_att_text(w.ncid, NC_GLOBAL, "platform_file",
+                    platform_file.size(), platform_file.c_str());
+    if (ex.platform_loaded) {
+        nc_put_att_text(w.ncid, NC_GLOBAL, "sensor2_model",
+                        strlen(ex.sensor2_model), ex.sensor2_model);
+        /* TX lever arm (offset 0): Starboard/Forward/Up in meters */
+        nc_put_att_double(w.ncid, NC_GLOBAL, "sensor2_tx_lever_sfm_m",
+                          NC_DOUBLE, 3, ex.tx_lever_sfm);
+        /* RX lever arm (offset 1): Starboard/Forward/Up in meters */
+        nc_put_att_double(w.ncid, NC_GLOBAL, "sensor2_rx_lever_sfm_m",
+                          NC_DOUBLE, 3, ex.rx_lever_sfm);
+        /* Shared boresight: Heading/Roll/Pitch in degrees */
+        nc_put_att_double(w.ncid, NC_GLOBAL, "sensor2_boresight_hrp_deg",
+                          NC_DOUBLE, 3, ex.boresight_hrp);
+    }
+
+    /* --- Kluge flags that affect beam geometry / depths --- */
+    int v;
+    v = ex.kluge_flipsign_pitch ? 1 : 0;
+    nc_put_att_int(w.ncid, NC_GLOBAL, "kluge_flipsign_pitch", NC_INT, 1, &v);
+    v = ex.kluge_flipsign_roll ? 1 : 0;
+    nc_put_att_int(w.ncid, NC_GLOBAL, "kluge_flipsign_roll",  NC_INT, 1, &v);
+    nc_put_att_double(w.ncid, NC_GLOBAL, "kluge_soundspeed_tweak",
+                      NC_DOUBLE, 1, &ex.kluge_soundspeed_tweak);
+    v = ex.attitude_zero_heave ? 1 : 0;
+    nc_put_att_int(w.ncid, NC_GLOBAL, "attitude_zero_heave",  NC_INT, 1, &v);
 
     NC_ERR(nc_enddef(w.ncid));
     return NC_NOERR;
@@ -278,15 +359,25 @@ constexpr char help_message[] =
 constexpr char usage_message[] =
     "mbcalibration_export -I datalist -O output.nc\n"
     "                     [--platform-file=path]\n"
-    "                     [--include-raw]\n"
-    "                     [-V] [-H]";
+    "                     [--kluge-flipsign-pitch]\n"
+    "                     [--kluge-flipsign-roll]\n"
+    "                     [--kluge-soundspeed-tweak=factor]\n"
+    "                     [--attitude-zero-heave]\n"
+    "                     [--include-raw] [-V] [-H]\n"
+    "\n"
+    "Kluge flags must match those used in the mbpreprocess command that\n"
+    "produced the .mb89 files — they are recorded as metadata for the optimizer.";
 
 static struct option long_options[] = {
-    {"platform-file",  required_argument, nullptr, 0},
-    {"include-raw",    no_argument,       nullptr, 0},
-    {"help",           no_argument,       nullptr, 'H'},
-    {"verbose",        no_argument,       nullptr, 'V'},
-    {nullptr,          0,                 nullptr, 0}
+    {"platform-file",          required_argument, nullptr, 0},
+    {"include-raw",            no_argument,       nullptr, 0},
+    {"kluge-flipsign-pitch",   no_argument,       nullptr, 0},
+    {"kluge-flipsign-roll",    no_argument,       nullptr, 0},
+    {"kluge-soundspeed-tweak", required_argument, nullptr, 0},
+    {"attitude-zero-heave",    no_argument,       nullptr, 0},
+    {"help",                   no_argument,       nullptr, 'H'},
+    {"verbose",                no_argument,       nullptr, 'V'},
+    {nullptr,                  0,                 nullptr, 0}
 };
 
 /* Build a command-line string from argv for metadata */
@@ -317,10 +408,11 @@ int main(int argc, char **argv) {
                 btime_i, etime_i, &speedmin, &timegap);
 
     /* Command-line parameters */
-    char read_file[MB_PATH_MAXLINE]    = "";
-    char output_file[MB_PATH_MAXLINE]  = "";
+    char read_file[MB_PATH_MAXLINE]     = "";
+    char output_file[MB_PATH_MAXLINE]   = "";
     char platform_file[MB_PATH_MAXLINE] = "";
     bool include_raw = false;
+    ExtrinsicsInfo ex;
 
     /* Parse arguments */
     {
@@ -330,12 +422,22 @@ int main(int argc, char **argv) {
         while ((c = getopt_long(argc, argv, "HhI:i:O:o:Vv",
                                 long_options, &option_index)) != -1) {
             switch (c) {
-            case 0:
-                if (strcmp(long_options[option_index].name, "platform-file") == 0)
+            case 0: {
+                const char *opt = long_options[option_index].name;
+                if (strcmp(opt, "platform-file") == 0)
                     snprintf(platform_file, sizeof(platform_file), "%s", optarg);
-                else if (strcmp(long_options[option_index].name, "include-raw") == 0)
+                else if (strcmp(opt, "include-raw") == 0)
                     include_raw = true;
+                else if (strcmp(opt, "kluge-flipsign-pitch") == 0)
+                    ex.kluge_flipsign_pitch = true;
+                else if (strcmp(opt, "kluge-flipsign-roll") == 0)
+                    ex.kluge_flipsign_roll = true;
+                else if (strcmp(opt, "kluge-soundspeed-tweak") == 0)
+                    sscanf(optarg, "%lf", &ex.kluge_soundspeed_tweak);
+                else if (strcmp(opt, "attitude-zero-heave") == 0)
+                    ex.attitude_zero_heave = true;
                 break;
+            }
             case 'H': case 'h':
                 help = true;
                 break;
@@ -375,15 +477,36 @@ int main(int argc, char **argv) {
         exit(MB_ERROR_BAD_PARAMETER);
     }
 
+    /* Load platform file extrinsics if provided */
+    if (strlen(platform_file) > 0) {
+        load_platform_extrinsics(platform_file, 2, ex);
+        if (!ex.platform_loaded)
+            fprintf(stderr, "Warning: could not read platform file %s\n",
+                    platform_file);
+    }
+
     if (verbose > 0) {
         fprintf(stderr, "\nProgram %s\nMB-system Version %s\n",
                 program_name, MB_VERSION);
         fprintf(stderr, "\nInput:           %s\n", read_file);
         fprintf(stderr, "Output:          %s\n", output_file);
-        fprintf(stderr, "Platform file:   %s\n",
-                strlen(platform_file) > 0 ? platform_file : "(none)");
-        fprintf(stderr, "Include raw:     %s\n\n",
-                include_raw ? "yes" : "no");
+        fprintf(stderr, "Platform file:   %s%s\n",
+                strlen(platform_file) > 0 ? platform_file : "(none)",
+                ex.platform_loaded ? " (loaded)" : "");
+        if (ex.platform_loaded) {
+            fprintf(stderr, "  Sensor 2 (%s) TX lever (S/F/U m): %.4f %.4f %.4f\n",
+                    ex.sensor2_model,
+                    ex.tx_lever_sfm[0], ex.tx_lever_sfm[1], ex.tx_lever_sfm[2]);
+            fprintf(stderr, "  Sensor 2 RX lever (S/F/U m): %.4f %.4f %.4f\n",
+                    ex.rx_lever_sfm[0], ex.rx_lever_sfm[1], ex.rx_lever_sfm[2]);
+            fprintf(stderr, "  Boresight (H/R/P deg): %.4f %.4f %.4f\n",
+                    ex.boresight_hrp[0], ex.boresight_hrp[1], ex.boresight_hrp[2]);
+        }
+        fprintf(stderr, "Kluge pitch flip: %s  roll flip: %s  ss_tweak: %.6f  zero_heave: %s\n\n",
+                ex.kluge_flipsign_pitch ? "yes" : "no",
+                ex.kluge_flipsign_roll  ? "yes" : "no",
+                ex.kluge_soundspeed_tweak,
+                ex.attitude_zero_heave  ? "yes" : "no");
     }
 
     /* Determine input type */
@@ -478,7 +601,7 @@ int main(int argc, char **argv) {
             if (!writer_open) {
                 std::string cmdline = reconstruct_cmdline(argc, argv);
                 if (calwriter_open(writer, output_file, beams_bath,
-                                   platform_file, cmdline) != NC_NOERR) {
+                                   platform_file, cmdline, ex) != NC_NOERR) {
                     fprintf(stderr, "Fatal: cannot create output file %s\n",
                             output_file);
                     mb_close(verbose, &mbio_ptr, &error);
