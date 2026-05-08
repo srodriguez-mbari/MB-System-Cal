@@ -57,12 +57,15 @@
     } \
 } while(0)
 
-/* Extrinsics and preprocessing flags to embed as optimizer starting point */
+/* Extrinsics and preprocessing flags to embed as optimizer starting point.
+ * Extrinsics = full 6-DOF sensor placement: [S, F, U meters, H, R, P degrees]
+ * matching the --sensor-offsets=S/F/U/H/R/P convention of mbmakeplatform. */
 struct ExtrinsicsInfo {
     char   sensor2_model[MB_LONGNAME_LENGTH] = {};
-    double tx_lever_sfm[3]  = {0, 0, 0};  /* TX (offset 0) S/F/U meters */
-    double rx_lever_sfm[3]  = {0, 0, 0};  /* RX (offset 1) S/F/U meters */
-    double boresight_hrp[3] = {0, 0, 0};  /* shared H/R/P degrees */
+    /* TX extrinsics (offset 0): [S,F,U m, H,R,P deg] */
+    double tx_extrinsics[6] = {0, 0, 0, 0, 0, 0};
+    /* RX extrinsics (offset 1): [S,F,U m, H,R,P deg] */
+    double rx_extrinsics[6] = {0, 0, 0, 0, 0, 0};
     bool   platform_loaded  = false;
 
     /* Kluge flags that have geometric impact on the data */
@@ -93,18 +96,21 @@ static void load_platform_extrinsics(const char *plf_path, int target_sensor,
 
     if (sensor->num_offsets >= 1) {
         struct mb_sensor_offset_struct *tx = &sensor->offsets[0];
-        ex.tx_lever_sfm[0]  = tx->position_offset_x;
-        ex.tx_lever_sfm[1]  = tx->position_offset_y;
-        ex.tx_lever_sfm[2]  = tx->position_offset_z;
-        ex.boresight_hrp[0] = tx->attitude_offset_heading;
-        ex.boresight_hrp[1] = tx->attitude_offset_roll;
-        ex.boresight_hrp[2] = tx->attitude_offset_pitch;
+        ex.tx_extrinsics[0] = tx->position_offset_x;      /* S */
+        ex.tx_extrinsics[1] = tx->position_offset_y;      /* F */
+        ex.tx_extrinsics[2] = tx->position_offset_z;      /* U */
+        ex.tx_extrinsics[3] = tx->attitude_offset_heading; /* H */
+        ex.tx_extrinsics[4] = tx->attitude_offset_roll;    /* R */
+        ex.tx_extrinsics[5] = tx->attitude_offset_pitch;   /* P */
     }
     if (sensor->num_offsets >= 2) {
         struct mb_sensor_offset_struct *rx = &sensor->offsets[1];
-        ex.rx_lever_sfm[0] = rx->position_offset_x;
-        ex.rx_lever_sfm[1] = rx->position_offset_y;
-        ex.rx_lever_sfm[2] = rx->position_offset_z;
+        ex.rx_extrinsics[0] = rx->position_offset_x;      /* S */
+        ex.rx_extrinsics[1] = rx->position_offset_y;      /* F */
+        ex.rx_extrinsics[2] = rx->position_offset_z;      /* U */
+        ex.rx_extrinsics[3] = rx->attitude_offset_heading; /* H */
+        ex.rx_extrinsics[4] = rx->attitude_offset_roll;    /* R */
+        ex.rx_extrinsics[5] = rx->attitude_offset_pitch;   /* P */
     }
     ex.platform_loaded = true;
     mb_platform_deall(verbose, &platform_ptr, &error);
@@ -186,11 +192,11 @@ static int calwriter_open(CalWriter& w, const std::string& path,
 
     /* Long-name hints for the optimizer */
     nc_put_att_text(w.ncid, w.vid_roll_raw,  "long_name",
-                    strlen("raw INS roll before boresight correction"),
-                             "raw INS roll before boresight correction");
+                    strlen("raw INS roll before extrinsics correction"),
+                             "raw INS roll before extrinsics correction");
     nc_put_att_text(w.ncid, w.vid_pitch_raw, "long_name",
-                    strlen("raw INS pitch before boresight correction"),
-                             "raw INS pitch before boresight correction");
+                    strlen("raw INS pitch before extrinsics correction"),
+                             "raw INS pitch before extrinsics correction");
 
     /* --- 2D per-beam variables ---
      * bath_acrosstrack / bath_alongtrack omitted: mb_read fills bathlon/bathlat
@@ -234,26 +240,25 @@ static int calwriter_open(CalWriter& w, const std::string& path,
     nc_put_att_text(w.ncid, NC_GLOBAL, "pitch_sign_convention",
                     strlen("bow-up-positive"), "bow-up-positive");
     nc_put_att_text(w.ncid, NC_GLOBAL, "roll_pitch_source",
-                    strlen("raw INS before boresight (from .baa ancillary file)"),
-                             "raw INS before boresight (from .baa ancillary file)");
+                    strlen("raw INS before extrinsics correction (from .baa ancillary file)"),
+                             "raw INS before extrinsics correction (from .baa ancillary file)");
     int target_sensor = 2;
     nc_put_att_int(w.ncid, NC_GLOBAL, "platform_target_sensor", NC_INT, 1, &target_sensor);
 
-    /* --- Platform file and sensor 2 extrinsics (optimizer starting point) --- */
+    /* --- Platform file and sensor 2 extrinsics (optimizer starting point) ---
+     * Extrinsics = [S, F, U meters, H, R, P degrees] per array element,
+     * matching the mbmakeplatform --sensor-offsets=S/F/U/H/R/P convention. */
     nc_put_att_text(w.ncid, NC_GLOBAL, "platform_file",
                     platform_file.size(), platform_file.c_str());
     if (ex.platform_loaded) {
         nc_put_att_text(w.ncid, NC_GLOBAL, "sensor2_model",
                         strlen(ex.sensor2_model), ex.sensor2_model);
-        /* TX lever arm (offset 0): Starboard/Forward/Up in meters */
-        nc_put_att_double(w.ncid, NC_GLOBAL, "sensor2_tx_lever_sfm_m",
-                          NC_DOUBLE, 3, ex.tx_lever_sfm);
-        /* RX lever arm (offset 1): Starboard/Forward/Up in meters */
-        nc_put_att_double(w.ncid, NC_GLOBAL, "sensor2_rx_lever_sfm_m",
-                          NC_DOUBLE, 3, ex.rx_lever_sfm);
-        /* Shared boresight: Heading/Roll/Pitch in degrees */
-        nc_put_att_double(w.ncid, NC_GLOBAL, "sensor2_boresight_hrp_deg",
-                          NC_DOUBLE, 3, ex.boresight_hrp);
+        /* TX extrinsics (offset 0): [S, F, U m, H, R, P deg] */
+        nc_put_att_double(w.ncid, NC_GLOBAL, "sensor2_tx_extrinsics",
+                          NC_DOUBLE, 6, ex.tx_extrinsics);
+        /* RX extrinsics (offset 1): [S, F, U m, H, R, P deg] */
+        nc_put_att_double(w.ncid, NC_GLOBAL, "sensor2_rx_extrinsics",
+                          NC_DOUBLE, 6, ex.rx_extrinsics);
     }
 
     /* --- Kluge flags that affect beam geometry / depths --- */
@@ -352,7 +357,7 @@ constexpr char program_name[] = "mbcalibration_export";
 
 constexpr char help_message[] =
     "mbcalibration_export exports per-ping calibration data from processed\n"
-    "MB-System .mb89 files to NetCDF4 for automated boresight and lever-arm\n"
+    "MB-System .mb89 files to NetCDF4 for automated extrinsics\n"
     "calibration. Ancillary files (.fnv, .baa) must exist alongside the .mb89\n"
     "files (produced by mbpreprocess --output-sensor-fnv).";
 
@@ -494,13 +499,13 @@ int main(int argc, char **argv) {
                 strlen(platform_file) > 0 ? platform_file : "(none)",
                 ex.platform_loaded ? " (loaded)" : "");
         if (ex.platform_loaded) {
-            fprintf(stderr, "  Sensor 2 (%s) TX lever (S/F/U m): %.4f %.4f %.4f\n",
+            fprintf(stderr, "  Sensor 2 (%s) TX extrinsics S/F/U m: %.4f %.4f %.4f  H/R/P deg: %.4f %.4f %.4f\n",
                     ex.sensor2_model,
-                    ex.tx_lever_sfm[0], ex.tx_lever_sfm[1], ex.tx_lever_sfm[2]);
-            fprintf(stderr, "  Sensor 2 RX lever (S/F/U m): %.4f %.4f %.4f\n",
-                    ex.rx_lever_sfm[0], ex.rx_lever_sfm[1], ex.rx_lever_sfm[2]);
-            fprintf(stderr, "  Boresight (H/R/P deg): %.4f %.4f %.4f\n",
-                    ex.boresight_hrp[0], ex.boresight_hrp[1], ex.boresight_hrp[2]);
+                    ex.tx_extrinsics[0], ex.tx_extrinsics[1], ex.tx_extrinsics[2],
+                    ex.tx_extrinsics[3], ex.tx_extrinsics[4], ex.tx_extrinsics[5]);
+            fprintf(stderr, "  Sensor 2 RX extrinsics S/F/U m: %.4f %.4f %.4f  H/R/P deg: %.4f %.4f %.4f\n",
+                    ex.rx_extrinsics[0], ex.rx_extrinsics[1], ex.rx_extrinsics[2],
+                    ex.rx_extrinsics[3], ex.rx_extrinsics[4], ex.rx_extrinsics[5]);
         }
         fprintf(stderr, "Kluge pitch flip: %s  roll flip: %s  ss_tweak: %.6f  zero_heave: %s\n\n",
                 ex.kluge_flipsign_pitch ? "yes" : "no",

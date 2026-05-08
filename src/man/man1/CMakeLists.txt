@@ -1,6 +1,7 @@
 message("In src/man/man1")
 
 set(manpages
+    mbcalibration_export.1
     mbabsorption.1
     mbareaclean.1
     mbauvloglist.1

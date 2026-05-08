@@ -1,0 +1,320 @@
+.TH mbcalibration_export 1 "8 May 2026" "MB-System 5.0" "MB-System 5.0"
+.SH NAME
+\fBmbcalibration_export\fP \- Export per-ping calibration data from processed swath sonar files to NetCDF4.
+
+.SH VERSION
+Version 5.0
+
+.SH SYNOPSIS
+\fBmbcalibration_export\fP \fB\-I\fP\fIdatalist\fP \fB\-O\fP\fIoutput.nc\fP
+[\fB\-\-platform\-file=\fP\fIpath\fP]
+[\fB\-\-kluge\-flipsign\-pitch\fP]
+[\fB\-\-kluge\-flipsign\-roll\fP]
+[\fB\-\-kluge\-soundspeed\-tweak=\fP\fIfactor\fP]
+[\fB\-\-attitude\-zero\-heave\fP]
+[\fB\-V\fP] [\fB\-H\fP]
+
+.SH DESCRIPTION
+\fBmbcalibration_export\fP reads MB-System processed .mb89 files together
+with their ancillary files (.fnv and .baa) produced by \fBmbpreprocess\fP,
+and exports per-ping calibration data to a NetCDF4 file for use by an
+automated extrinsics calibration pipeline.
+
+The tool is designed for ROV/AUV multibeam surveys where the sonar mounting
+angles (attitude offset) and position offsets relative to the navigation sensor need to
+be calibrated from overlapping swath data. The exported NetCDF4 file contains
+everything the optimizer needs:
+
+.IP \(bu 2
+Per-ping navigation (lon/lat/depth/heading) after position offset correction
+.IP \(bu 2
+Raw INS attitude (roll/pitch) from the .baa ancillary file, \fIbefore\fP
+any platform attitude offset correction is applied — as required by the optimizer
+.IP \(bu 2
+Per-beam world-frame sounding positions (lon/lat/depth)
+.IP \(bu 2
+Beam quality flags
+.IP \(bu 2
+Starting extrinsics from the platform file,
+embedded as NetCDF global attributes for use as optimizer initial conditions
+.IP \(bu 2
+Preprocessing flags that affected the data geometry
+
+The ancillary files (.fnv, .baa) must be present alongside each .mb89 file.
+They are produced by running \fBmbpreprocess\fP with the
+\fB\-\-output\-sensor\-fnv\fP flag.
+
+.SH MB-SYSTEM COMPATIBILITY
+\fBmbcalibration_export\fP reads only processed .mb89 files and their
+ancillary files. It does not modify any existing MB-System files and has
+no effect on the behavior of other MB-System tools.
+
+.SH AUTHORSHIP
+Sebastian Rodriguez (srodriguez@mbari.org)
+.br
+Monterey Bay Aquarium Research Institute
+
+.SH OPTIONS
+.TP
+.B \-H
+This "help" flag causes the program to print out a description of its
+operation and then exit immediately.
+
+.TP
+.B \-I \fIdatalist\fP
+Sets the filename of the file containing a list of the input swath sonar
+data files and their formats. In the \fBMB-System\fP datalist format, each
+swath data file is followed by a data format identifier. A datalist must
+contain data from a single survey (same platform file and preprocessing
+parameters) because the metadata is written once per output file.
+
+.TP
+.B \-O \fIoutput.nc\fP
+Sets the name of the output NetCDF4 file. The file is overwritten if it
+already exists.
+
+.TP
+.B \-\-platform\-file=\fIpath\fP
+Specifies the MB-System platform file (.plf) used during preprocessing.
+When provided, sensor 2 extrinsics (position and attitude offsets) are read and written
+as global attributes \fIsensor2_tx_extrinsics\fP,
+\fIsensor2_rx_extrinsics\fP, and \fIsensor2_tx_extrinsics\fP.
+These serve as the optimizer's starting point. The frame convention is
+Starboard/Forward/Up (meters) for position offsets and Heading/Roll/Pitch
+(degrees) for attitude offset.
+
+.TP
+.B \-\-kluge\-flipsign\-pitch
+Records that \fBmbpreprocess\fP was run with \fB\-\-kluge\-flipsign\-pitch\fP,
+which inverts the sign of pitch in the INS attitude stream. This is required
+for INS systems (e.g., Phins C7) that report pitch with the opposite sign
+convention from what MB-System expects. The flag is written as the global
+attribute \fIkluge_flipsign_pitch=1\fP. Note: the pitch values in the
+exported .baa-derived \fIroll_raw\fP/\fIpitch_raw\fP variables already
+reflect this correction (applied during mbpreprocess); this flag is metadata
+only.
+
+.TP
+.B \-\-kluge\-flipsign\-roll
+Records that \fBmbpreprocess\fP was run with \fB\-\-kluge\-flipsign\-roll\fP.
+Written as global attribute \fIkluge_flipsign_roll=1\fP.
+
+.TP
+.B \-\-kluge\-soundspeed\-tweak=\fIfactor\fP
+Records the sound speed scaling factor used during preprocessing. The
+factor is applied to beam RX angles via Snell's law during mbpreprocess,
+changing computed depths (factor < 1 gives shallower depths). Written
+as global attribute \fIkluge_soundspeed_tweak\fP. Default: 1.0.
+
+.TP
+.B \-\-attitude\-zero\-heave
+Records that \fBmbpreprocess\fP was run with \fB\-\-attitude\-zero\-heave\fP,
+which sets heave to zero in the depth calculation. Written as global
+attribute \fIattitude_zero_heave=1\fP.
+
+.TP
+.B \-V
+The \fB\-V\fP flag causes \fBmbcalibration_export\fP to print progress
+messages to stderr.
+
+.SH OUTPUT FORMAT
+The output is a NetCDF4 file (HDF5 backend) with two dimensions:
+\fIn_ping\fP (unlimited, one per survey ping) and \fImax_beam\fP
+(fixed at the maximum beam count reported by the sonar format).
+
+Per-beam variables use \fBNC_FILL_DOUBLE\fP for unused beam slots
+beyond \fIn_beams[i]\fP. The \fIn_beams\fP variable tells consumers
+how many beams are valid for each ping.
+
+.SS Per-ping variables (dimension: n_ping)
+.TP
+\fIping_time\fP (float64)
+Unix epoch seconds. Units: "seconds since 1970-01-01T00:00:00Z".
+
+.TP
+\fInav_lon\fP, \fInav_lat\fP (float64)
+World-frame position of the target sensor (multibeam phase center)
+after position offset correction from the navigation source. Units: degrees.
+
+.TP
+\fIsonar_depth\fP (float64)
+Sensor depth below sea surface, positive down. Units: meters.
+
+.TP
+\fIaltitude\fP (float64)
+Height above seafloor. Units: meters.
+
+.TP
+\fIheading\fP (float64)
+True heading. Units: degrees.
+
+.TP
+\fIspeed\fP (float64)
+Speed. Units: km/hr.
+
+.TP
+\fIroll_raw\fP, \fIpitch_raw\fP (float64)
+Raw INS roll and pitch from the .baa ancillary file, interpolated to
+ping transmit time. These are the attitude values \fIbefore\fP the
+platform attitude offset rotation is applied. The optimizer applies trial
+attitude offset corrections to these values. Sign convention: bow-up pitch
+positive, starboard-down roll positive.
+
+.TP
+\fIheave\fP (float64)
+Heave at ping time from the .fnv ancillary file. Units: meters.
+
+.TP
+\fIn_beams\fP (int32)
+Number of valid beams for this ping. Beam arrays are filled up to this
+index; slots beyond are fill values.
+
+.SS Per-beam variables (dimensions: n_ping, max_beam)
+.TP
+\fIbath_depth\fP (float64)
+Sounding depth for each beam, positive down. Units: meters.
+This is the depth after all platform corrections (position offset and attitude offset)
+were applied by \fBmbpreprocess\fP.
+
+.TP
+\fIbath_lon\fP, \fIbath_lat\fP (float64)
+World-frame longitude and latitude of each beam sounding. Units: degrees.
+
+.TP
+\fIamplitude\fP (float32)
+Beam amplitude. Units: dB (sensor-dependent).
+
+.TP
+\fIbeam_flag\fP (uint8)
+Full MB-System beam quality flag. See MB-System documentation for flag
+bit definitions.
+
+.TP
+\fIbeam_ok\fP (uint8)
+1 if the beam is flagged as good (mb_beam_ok() is true), 0 otherwise.
+Convenience variable for filtering.
+
+.SS Global attributes
+Key metadata attributes embedded in the NetCDF file:
+
+.TP
+\fImbsystem_version\fP
+MB-System version string used to produce this file.
+
+.TP
+\fIcreation_time\fP
+ISO-8601 UTC timestamp when the file was created.
+
+.TP
+\fIcommand_line\fP
+The exact command used to run \fBmbcalibration_export\fP.
+
+.TP
+\fIplatform_file\fP
+Path to the platform file, if \fB\-\-platform\-file\fP was specified.
+
+.TP
+\fIsensor2_tx_extrinsics\fP, \fIsensor2_rx_extrinsics\fP
+[S, F, U] position offsets for the TX and RX arrays of sensor 2 in the
+Starboard/Forward/Up frame, in meters. Populated when
+\fB\-\-platform\-file\fP is provided.
+
+.TP
+\fIsensor2_tx_extrinsics\fP
+[H, R, P] attitude offset of sensor 2 in Heading/Roll/Pitch degrees.
+This is the starting point for the calibration optimizer.
+
+.TP
+\fIkluge_flipsign_pitch\fP, \fIkluge_flipsign_roll\fP
+Integer (0 or 1). Records whether pitch or roll sign was inverted
+during preprocessing.
+
+.TP
+\fIkluge_soundspeed_tweak\fP
+Float. Sound speed scaling factor applied during preprocessing.
+
+.TP
+\fIattitude_zero_heave\fP
+Integer (0 or 1). Records whether heave was zeroed during preprocessing.
+
+.TP
+\fIframe_convention\fP
+"starboard-forward-up" — the coordinate frame for position offsets.
+
+.TP
+\fIpitch_sign_convention\fP
+"bow-up-positive" — pitch is positive when the bow is elevated.
+
+.TP
+\fIroll_pitch_source\fP
+"raw INS before attitude offset (from .baa ancillary file)"
+
+.SH EXAMPLES
+Export a survey with platform file and preprocessing flags:
+.br
+.B mbcalibration_export -I datalist.mb-1 -O cal_2025.nc \\\\
+.br
+.B "    " --platform-file=../platform.plf \\\\
+.br
+.B "    " --kluge-soundspeed-tweak=0.9996 -V
+
+Export a Phins C7 survey (requires pitch sign correction):
+.br
+.B mbcalibration_export -I datalist.mb-1 -O cal_2026.nc \\\\
+.br
+.B "    " --platform-file=../platform.plf \\\\
+.br
+.B "    " --kluge-flipsign-pitch --attitude-zero-heave -V
+
+Read the output in Python:
+.nf
+    import netCDF4 as nc
+    import numpy as np
+
+    ds = nc.Dataset('cal_2025.nc')
+
+    # Starting extrinsics for the optimizer
+    attitude offset = ds.getncattr('sensor2_tx_extrinsics')  # [H, R, P] deg
+    tx_lever  = ds.getncattr('sensor2_tx_extrinsics')    # [S, F, U] m
+
+    # Per-ping data
+    ping_time = ds['ping_time'][:]       # Unix epoch seconds
+    nav_lon   = ds['nav_lon'][:]         # degrees
+    nav_lat   = ds['nav_lat'][:]         # degrees
+    roll_raw  = ds['roll_raw'][:]        # degrees, before attitude offset
+    pitch_raw = ds['pitch_raw'][:]       # degrees, before attitude offset
+
+    # Per-beam world-frame soundings (good beams only)
+    for i in range(len(ping_time)):
+        nb = ds['n_beams'][i]
+        ok = ds['beam_ok'][i, :nb] == 1
+        lon   = ds['bath_lon'][i, :nb][ok]
+        lat   = ds['bath_lat'][i, :nb][ok]
+        depth = ds['bath_depth'][i, :nb][ok]
+
+    ds.close()
+.fi
+
+.SH NOTES
+The kluge flags passed to \fBmbcalibration_export\fP must match those used
+in the \fBmbpreprocess\fP command that produced the .mb89 files. The tool
+does not apply these corrections — it records them as metadata so the
+calibration optimizer can correctly interpret the attitude convention.
+
+The \fIroll_raw\fP and \fIpitch_raw\fP variables come from the .baa
+ancillary file and represent the INS attitude \fIafter\fP any sign-flip
+kluge applied during \fBmbpreprocess\fP, and \fIbefore\fP the platform
+attitude offset rotation. The world-frame soundings (\fIbath_depth\fP,
+\fIbath_lon\fP, \fIbath_lat\fP) have the current attitude offset baked in —
+they represent the "ground truth" reference surface against which the
+optimizer tests trial attitude offset values.
+
+.SH SEE ALSO
+\fBmbsystem\fP(1), \fBmbpreprocess\fP(1), \fBmbmakeplatform\fP(1),
+\fBmbinfo\fP(1), \fBmbnavlist\fP(1)
+
+.SH BUGS
+The kluge flags must be specified manually by the user — they are not
+automatically read from the .par parameter file. This means the user
+must ensure consistency between the mbpreprocess command and the
+mbcalibration_export command.
