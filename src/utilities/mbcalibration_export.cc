@@ -29,12 +29,14 @@
  * Date:     2026-05-08
  */
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <getopt.h>
+#include <limits>
 #include <unistd.h>
 #include <string>
 #include <vector>
@@ -45,7 +47,175 @@
 #include "mb_format.h"
 #include "mb_io.h"
 #include "mb_status.h"
-#include "mb_ancillary_io.h"
+
+/* ======================================================================
+ * Ancillary file readers (formerly mb_ancillary_io.h/.cc)
+ * Merged here to minimise library footprint — used only by this tool.
+ * ====================================================================== */
+
+struct MbFnvRecord {
+    double time_d;       /* Unix epoch seconds */
+    double navlon;       /* degrees East */
+    double navlat;       /* degrees North */
+    double heading;      /* degrees true */
+    double speed;        /* km/hr */
+    double sensordepth;  /* meters, positive down */
+    double roll;         /* degrees */
+    double pitch;        /* degrees */
+    double heave;        /* meters */
+};
+
+/* .baa / .bsa: big-endian double time_d + float roll + float pitch (16 bytes) */
+struct MbBaaRecord {
+    double time_d;
+    float  roll;
+    float  pitch;
+};
+
+/* .bah: big-endian double time_d + float heading (12 bytes) */
+struct MbBahRecord {
+    double time_d;
+    float  heading;
+};
+
+/* .bas: big-endian double time_d + float sensordepth (12 bytes) */
+struct MbBasRecord {
+    double time_d;
+    float  sensordepth;
+};
+
+static bool anc_read_dff(FILE* fp, double* d, float* f1, float* f2) {
+    unsigned char buf[16];
+    if (fread(buf, 1, 16, fp) != 16) return false;
+    mb_get_binary_double(true, buf,      d);
+    mb_get_binary_float (true, buf + 8,  f1);
+    mb_get_binary_float (true, buf + 12, f2);
+    return true;
+}
+
+static bool anc_read_df(FILE* fp, double* d, float* f) {
+    unsigned char buf[12];
+    if (fread(buf, 1, 12, fp) != 12) return false;
+    mb_get_binary_double(true, buf,     d);
+    mb_get_binary_float (true, buf + 8, f);
+    return true;
+}
+
+/* .fnv format: 19 columns per line (see mbpreprocess.cc:3428 for format string).
+ * Columns 1-6 = calendar time (unused), 7=time_d, 8-9=lon/lat, 10=heading,
+ * 11=speed, 12=sensordepth, 13=roll, 14=pitch, 15=heave, 16-19=swath limits. */
+static std::vector<MbFnvRecord> mb_read_fnv(const std::string& path) {
+    std::vector<MbFnvRecord> recs;
+    FILE* fp = fopen(path.c_str(), "r");
+    if (!fp) return recs;
+    char line[1024];
+    while (fgets(line, sizeof(line), fp)) {
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
+        int yr, mo, dy, hr, mn; double sec;
+        MbFnvRecord r; double p1, p2, p3, p4;
+        int n = sscanf(line,
+            "%d %d %d %d %d %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf",
+            &yr, &mo, &dy, &hr, &mn, &sec,
+            &r.time_d, &r.navlon, &r.navlat, &r.heading, &r.speed,
+            &r.sensordepth, &r.roll, &r.pitch, &r.heave, &p1, &p2, &p3, &p4);
+        if (n >= 15) recs.push_back(r);
+    }
+    fclose(fp);
+    return recs;
+}
+
+static std::vector<MbBaaRecord> mb_read_baa(const std::string& path) {
+    std::vector<MbBaaRecord> recs;
+    FILE* fp = fopen(path.c_str(), "rb");
+    if (!fp) return recs;
+    fseek(fp, 0, SEEK_END); long sz = ftell(fp); rewind(fp);
+    if (sz > 0 && sz % 16 == 0) recs.reserve((size_t)(sz / 16));
+    MbBaaRecord r;
+    while (anc_read_dff(fp, &r.time_d, &r.roll, &r.pitch)) recs.push_back(r);
+    fclose(fp);
+    return recs;
+}
+
+static std::vector<MbBahRecord> mb_read_bah(const std::string& path) {
+    std::vector<MbBahRecord> recs;
+    FILE* fp = fopen(path.c_str(), "rb");
+    if (!fp) return recs;
+    fseek(fp, 0, SEEK_END); long sz = ftell(fp); rewind(fp);
+    if (sz > 0 && sz % 12 == 0) recs.reserve((size_t)(sz / 12));
+    MbBahRecord r;
+    while (anc_read_df(fp, &r.time_d, &r.heading)) recs.push_back(r);
+    fclose(fp);
+    return recs;
+}
+
+static std::vector<MbBasRecord> mb_read_bas(const std::string& path) {
+    std::vector<MbBasRecord> recs;
+    FILE* fp = fopen(path.c_str(), "rb");
+    if (!fp) return recs;
+    fseek(fp, 0, SEEK_END); long sz = ftell(fp); rewind(fp);
+    if (sz > 0 && sz % 12 == 0) recs.reserve((size_t)(sz / 12));
+    MbBasRecord r;
+    while (anc_read_df(fp, &r.time_d, &r.sensordepth)) recs.push_back(r);
+    fclose(fp);
+    return recs;
+}
+
+template <typename T>
+static size_t anc_find_lower(const std::vector<T>& recs, double t) {
+    size_t lo = 0, hi = recs.size() - 1;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo + 1) / 2;
+        if (recs[mid].time_d <= t) lo = mid; else hi = mid - 1;
+    }
+    return lo;
+}
+
+static bool mb_interp_attitude(const std::vector<MbBaaRecord>& recs,
+                               double t, double* roll, double* pitch) {
+    if (recs.empty()) {
+        *roll = *pitch = std::numeric_limits<double>::quiet_NaN();
+        return false;
+    }
+    if (t <= recs.front().time_d) { *roll = recs.front().roll; *pitch = recs.front().pitch; return true; }
+    if (t >= recs.back().time_d)  { *roll = recs.back().roll;  *pitch = recs.back().pitch;  return true; }
+    size_t i = anc_find_lower(recs, t);
+    double t0 = recs[i].time_d, t1 = recs[i+1].time_d;
+    double f = (t1 > t0) ? (t - t0) / (t1 - t0) : 0.0;
+    *roll  = recs[i].roll  + f * (recs[i+1].roll  - recs[i].roll);
+    *pitch = recs[i].pitch + f * (recs[i+1].pitch - recs[i].pitch);
+    return true;
+}
+
+static bool mb_interp_heading(const std::vector<MbBahRecord>& recs,
+                              double t, double* heading) {
+    if (recs.empty()) { *heading = std::numeric_limits<double>::quiet_NaN(); return false; }
+    if (t <= recs.front().time_d) { *heading = recs.front().heading; return true; }
+    if (t >= recs.back().time_d)  { *heading = recs.back().heading;  return true; }
+    size_t i = anc_find_lower(recs, t);
+    double t0 = recs[i].time_d, t1 = recs[i+1].time_d;
+    double f = (t1 > t0) ? (t - t0) / (t1 - t0) : 0.0;
+    double h0 = recs[i].heading, h1 = recs[i+1].heading, diff = h1 - h0;
+    if (diff >  180.0) diff -= 360.0;
+    if (diff < -180.0) diff += 360.0;
+    double h = h0 + f * diff;
+    if (h < 0.0) h += 360.0; else if (h >= 360.0) h -= 360.0;
+    *heading = h;
+    return true;
+}
+
+static bool mb_interp_sensordepth(const std::vector<MbBasRecord>& recs,
+                                  double t, double* sd) {
+    if (recs.empty()) { *sd = std::numeric_limits<double>::quiet_NaN(); return false; }
+    if (t <= recs.front().time_d) { *sd = recs.front().sensordepth; return true; }
+    if (t >= recs.back().time_d)  { *sd = recs.back().sensordepth;  return true; }
+    size_t i = anc_find_lower(recs, t);
+    double t0 = recs[i].time_d, t1 = recs[i+1].time_d;
+    double f = (t1 > t0) ? (t - t0) / (t1 - t0) : 0.0;
+    *sd = recs[i].sensordepth + f * (recs[i+1].sensordepth - recs[i].sensordepth);
+    return true;
+}
+
+/* End of ancillary file readers */
 
 
 #define NC_ERR(call) do { \

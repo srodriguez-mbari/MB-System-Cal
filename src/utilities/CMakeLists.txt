@@ -84,8 +84,7 @@ file(WRITE levitus.h
   "const char *levitusfile = \"${CMAKE_INSTALL_PREFIX}/${levitusDir}/LevitusAnnual82.dat\";\nconst char *otps_location = \"${otpsDir}\";\n")
 
 add_executable(mbcalibration_export
-    mbcalibration_export.cc
-    mb_ancillary_io.cc)
+    mbcalibration_export.cc)
 target_link_libraries(mbcalibration_export PRIVATE mbio mbbsio mbaux mbsapi mbgsf m pthread NetCDF::NetCDF)
 
 target_link_libraries(mbsvpselect PRIVATE LibPROJ::LibPROJ)
