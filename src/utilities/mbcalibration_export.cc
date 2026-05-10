@@ -15,15 +15,17 @@
  * Output schema (NetCDF4):
  *   Dimensions:  n_ping (unlimited), max_beam (fixed)
  *   Per-ping scalars (float64): ping_time, nav_lon, nav_lat, sonar_depth,
- *       altitude, heading, speed, roll_raw, pitch_raw, heave
+ *       altitude, heading, speed, roll, pitch, heave
  *   Per-ping int (int32): n_beams
  *   Per-beam (float64, [n_ping, max_beam]):
  *       bath_depth, bath_lon, bath_lat
  *   Per-beam amplitude (float32): amplitude
  *   Per-beam flags (uint8): beam_flag, beam_ok
  *
- * roll_raw / pitch_raw come from .baa — raw INS attitude BEFORE the
- * platform boresight correction, as required by the optimizer.
+ * roll / pitch come from .fnv — corrected INS attitude AFTER all platform
+ * transforms (lever arm + boresight).  This is the attitude MB-System used
+ * to place bath_lon/bath_lat in the world frame, so it is the only attitude
+ * that correctly inverts the transformation back to sensor frame.
  *
  * Author:   Sebastian Rodriguez
  * Date:     2026-05-08
@@ -215,6 +217,43 @@ static bool mb_interp_sensordepth(const std::vector<MbBasRecord>& recs,
     return true;
 }
 
+/* Look up corrected roll, pitch, and heave from .fnv records by nearest time_d.
+ *
+ * .fnv has exactly one record per survey ping, written with the same time_d
+ * that is stored in the .mb89 ping record.  This is a 1:1 match, not an
+ * interpolation problem — interpolating between adjacent ping records would
+ * blend attitudes that belong to distinct pings and introduce geometric error.
+ *
+ * anc_find_lower() returns the largest index i where recs[i].time_d <= t.
+ * We then pick whichever neighbor (i or i+1) is closer in time. */
+static bool mb_interp_fnv_attitude(const std::vector<MbFnvRecord>& recs,
+                                   double t,
+                                   double* roll, double* pitch, double* heave) {
+    if (recs.empty()) {
+        *roll = *pitch = *heave = std::numeric_limits<double>::quiet_NaN();
+        return false;
+    }
+    if (recs.size() == 1 || t <= recs.front().time_d) {
+        *roll = recs.front().roll; *pitch = recs.front().pitch; *heave = recs.front().heave;
+        return true;
+    }
+    if (t >= recs.back().time_d) {
+        *roll = recs.back().roll; *pitch = recs.back().pitch; *heave = recs.back().heave;
+        return true;
+    }
+    size_t i = anc_find_lower(recs, t);
+    /* Pick the closer of i and i+1 */
+    if (i + 1 < recs.size()) {
+        double dt_lo = t - recs[i].time_d;
+        double dt_hi = recs[i + 1].time_d - t;
+        if (dt_hi < dt_lo) i += 1;
+    }
+    *roll  = recs[i].roll;
+    *pitch = recs[i].pitch;
+    *heave = recs[i].heave;
+    return true;
+}
+
 /* End of ancillary file readers */
 
 
@@ -294,7 +333,7 @@ struct CalWriter {
     /* 1D variable IDs */
     int vid_ping_time, vid_nav_lon, vid_nav_lat, vid_sonar_depth;
     int vid_altitude, vid_heading, vid_speed;
-    int vid_roll_raw, vid_pitch_raw, vid_heave, vid_n_beams;
+    int vid_roll, vid_pitch, vid_heave, vid_n_beams;
 
     /* 2D variable IDs [n_ping, max_beam] */
     int vid_bath_depth, vid_bath_lon, vid_bath_lat;
@@ -343,8 +382,8 @@ static int calwriter_open(CalWriter& w, const std::string& path,
     NC_ERR(nc_def_var(w.ncid, "altitude",    NC_DOUBLE, 1, dims1, &w.vid_altitude));
     NC_ERR(nc_def_var(w.ncid, "heading",     NC_DOUBLE, 1, dims1, &w.vid_heading));
     NC_ERR(nc_def_var(w.ncid, "speed",       NC_DOUBLE, 1, dims1, &w.vid_speed));
-    NC_ERR(nc_def_var(w.ncid, "roll_raw",    NC_DOUBLE, 1, dims1, &w.vid_roll_raw));
-    NC_ERR(nc_def_var(w.ncid, "pitch_raw",   NC_DOUBLE, 1, dims1, &w.vid_pitch_raw));
+    NC_ERR(nc_def_var(w.ncid, "roll",    NC_DOUBLE, 1, dims1, &w.vid_roll));
+    NC_ERR(nc_def_var(w.ncid, "pitch",   NC_DOUBLE, 1, dims1, &w.vid_pitch));
     NC_ERR(nc_def_var(w.ncid, "heave",       NC_DOUBLE, 1, dims1, &w.vid_heave));
     NC_ERR(nc_def_var(w.ncid, "n_beams",     NC_INT,    1, dims1, &w.vid_n_beams));
 
@@ -356,17 +395,17 @@ static int calwriter_open(CalWriter& w, const std::string& path,
     add_units(w.ncid, w.vid_altitude,    "m");
     add_units(w.ncid, w.vid_heading,     "degrees_true");
     add_units(w.ncid, w.vid_speed,       "km/hr");
-    add_units(w.ncid, w.vid_roll_raw,    "degrees");
-    add_units(w.ncid, w.vid_pitch_raw,   "degrees");
+    add_units(w.ncid, w.vid_roll,    "degrees");
+    add_units(w.ncid, w.vid_pitch,   "degrees");
     add_units(w.ncid, w.vid_heave,       "m");
 
     /* Long-name hints for the optimizer */
-    nc_put_att_text(w.ncid, w.vid_roll_raw,  "long_name",
-                    strlen("raw INS roll before extrinsics correction"),
-                             "raw INS roll before extrinsics correction");
-    nc_put_att_text(w.ncid, w.vid_pitch_raw, "long_name",
-                    strlen("raw INS pitch before extrinsics correction"),
-                             "raw INS pitch before extrinsics correction");
+    nc_put_att_text(w.ncid, w.vid_roll,  "long_name",
+                    strlen("corrected roll from .fnv (after lever arm and boresight)"),
+                             "corrected roll from .fnv (after lever arm and boresight)");
+    nc_put_att_text(w.ncid, w.vid_pitch, "long_name",
+                    strlen("corrected pitch from .fnv (after lever arm and boresight)"),
+                             "corrected pitch from .fnv (after lever arm and boresight)");
 
     /* --- 2D per-beam variables ---
      * bath_acrosstrack / bath_alongtrack omitted: mb_read fills bathlon/bathlat
@@ -404,14 +443,14 @@ static int calwriter_open(CalWriter& w, const std::string& path,
     nc_put_att_text(w.ncid, NC_GLOBAL, "command_line",
                     command_line.size(), command_line.c_str());
     nc_put_att_text(w.ncid, NC_GLOBAL, "attitude_source",
-                    strlen(".baa ancillary file"), ".baa ancillary file");
+                    strlen(".fnv ancillary file"), ".fnv ancillary file");
     nc_put_att_text(w.ncid, NC_GLOBAL, "frame_convention",
                     strlen("starboard-forward-up"), "starboard-forward-up");
     nc_put_att_text(w.ncid, NC_GLOBAL, "pitch_sign_convention",
                     strlen("bow-up-positive"), "bow-up-positive");
     nc_put_att_text(w.ncid, NC_GLOBAL, "roll_pitch_source",
-                    strlen("raw INS before extrinsics correction (from .baa ancillary file)"),
-                             "raw INS before extrinsics correction (from .baa ancillary file)");
+                    strlen("corrected attitude after platform transforms (from .fnv ancillary file)"),
+                             "corrected attitude after platform transforms (from .fnv ancillary file)");
     int target_sensor = 2;
     nc_put_att_int(w.ncid, NC_GLOBAL, "platform_target_sensor", NC_INT, 1, &target_sensor);
 
@@ -449,7 +488,7 @@ static int calwriter_open(CalWriter& w, const std::string& path,
 static int calwriter_add_ping(CalWriter& w,
     double time_d, double nav_lon, double nav_lat,
     double sonar_depth, double altitude, double heading, double speed,
-    double roll_raw, double pitch_raw, double heave,
+    double roll, double pitch, double heave,
     int n_beams,
     const double *bath_depth, const double *bath_lon,
     const double *bath_lat,   const double *amp_d,
@@ -469,8 +508,8 @@ static int calwriter_add_ping(CalWriter& w,
     NC_ERR(nc_put_vara_double(w.ncid, w.vid_altitude,    start1, count1, &altitude));
     NC_ERR(nc_put_vara_double(w.ncid, w.vid_heading,     start1, count1, &heading));
     NC_ERR(nc_put_vara_double(w.ncid, w.vid_speed,       start1, count1, &speed));
-    NC_ERR(nc_put_vara_double(w.ncid, w.vid_roll_raw,    start1, count1, &roll_raw));
-    NC_ERR(nc_put_vara_double(w.ncid, w.vid_pitch_raw,   start1, count1, &pitch_raw));
+    NC_ERR(nc_put_vara_double(w.ncid, w.vid_roll,    start1, count1, &roll));
+    NC_ERR(nc_put_vara_double(w.ncid, w.vid_pitch,   start1, count1, &pitch));
     NC_ERR(nc_put_vara_double(w.ncid, w.vid_heave,       start1, count1, &heave));
     NC_ERR(nc_put_vara_int   (w.ncid, w.vid_n_beams,     start1, count1, &n_beams));
 
@@ -745,15 +784,12 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Warning: no .fnv records for %s — skipping\n", file);
             goto next_file;
         }
-        if (baa_recs.empty()) {
-            fprintf(stderr, "Warning: no .baa records for %s — skipping\n", file);
-            goto next_file;
-        }
+        if (baa_recs.empty() && verbose > 0)
+            fprintf(stderr, "  Note: no .baa records for %s (not needed for corrected attitude)\n", file);
 
         if (verbose > 0) {
             fprintf(stderr, "File %d: %s\n", n_files, file);
-            fprintf(stderr, "  .fnv pings: %zu   .baa records: %zu\n",
-                    fnv_recs.size(), baa_recs.size());
+            fprintf(stderr, "  .fnv pings: %zu\n", fnv_recs.size());
         }
 
         {
@@ -844,31 +880,17 @@ int main(int argc, char **argv) {
                 if (status != MB_SUCCESS)
                     continue;
 
-                /* Get raw attitude (before boresight) from .baa */
-                double raw_roll, raw_pitch;
-                mb_interp_attitude(baa_recs, time_d, &raw_roll, &raw_pitch);
-
-                /* Get heave from .fnv (nav_lon/lat/heave from .fnv for reference) */
-                /* We use mb_read's navlon/navlat/heading/speed for per-ping scalars
-                 * since they represent the same lever-arm-corrected values as .fnv */
-                double heave = 0.0;
-                /* Binary-search fnv_recs for the matching time_d */
-                {
-                    size_t lo = 0, hi = fnv_recs.size();
-                    while (lo + 1 < hi) {
-                        size_t mid = lo + (hi - lo) / 2;
-                        if (fnv_recs[mid].time_d <= time_d) lo = mid;
-                        else hi = mid;
-                    }
-                    if (lo < fnv_recs.size())
-                        heave = fnv_recs[lo].heave;
-                }
+                /* Get corrected attitude and heave from .fnv.
+                 * These are the values MB-System used to place bath_lon/bath_lat
+                 * in the world frame — required to correctly invert Tsw. */
+                double fnv_roll, fnv_pitch, heave;
+                mb_interp_fnv_attitude(fnv_recs, time_d, &fnv_roll, &fnv_pitch, &heave);
 
                 /* Write to NetCDF */
                 calwriter_add_ping(writer,
                     time_d, navlon, navlat, sensordepth, altitude,
                     heading, speed,
-                    raw_roll, raw_pitch, heave,
+                    fnv_roll, fnv_pitch, heave,
                     beams_bath,
                     bath, bathlon, bathlat,
                     amp, beamflag);
