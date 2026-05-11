@@ -98,4 +98,4 @@ target_compile_definitions(
 target_compile_definitions(
   mblevitus PRIVATE ENV_LEVITUSANNUAL82="${CMAKE_INSTALL_PREFIX}/${levitusDir}/LevitusAnnual82.dat")
 
-install(TARGETS ${executables} mbconfig mblevitus DESTINATION ${CMAKE_INSTALL_BINDIR})
+  install(TARGETS ${executables} mbconfig mblevitus mbcalibration_export DESTINATION ${CMAKE_INSTALL_BINDIR})
